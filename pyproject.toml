@@ -1,0 +1,55 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "agentic-rtl-coder"
+version = "0.1.0"
+description = "AI-powered Verilog RTL generation with self-correcting lint & simulation feedback loops."
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+authors = [
+    { name = "Manish Swarnakar" },
+]
+keywords = ["rtl", "verilog", "hardware", "ai", "eda", "ollama", "verilator", "icarus"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Topic :: Scientific/Engineering :: Electronic Design Automation (EDA)",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+]
+
+# No runtime dependencies beyond the Python standard library.
+dependencies = []
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "ruff>=0.4",
+]
+
+[project.scripts]
+agentic-rtl-coder = "agentic_rtl_coder:main"
+
+[project.urls]
+Homepage = "https://github.com/ManishSwarnakar/Agentic_RTL_Coder"
+Repository = "https://github.com/ManishSwarnakar/Agentic_RTL_Coder"
+Issues = "https://github.com/ManishSwarnakar/Agentic_RTL_Coder/issues"
+
+# ── Tool configuration ───────────────────────────────────────────────────
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "UP", "B", "SIM"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

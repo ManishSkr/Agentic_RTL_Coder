@@ -1,424 +1,651 @@
 #!/usr/bin/env python3
 """
-rtl_pipeline_full.py
+agentic_rtl_coder.py
 
-Complete RTL pipeline using local Ollama models:
- - llama3.1 for prompt enhancement
- - deepseek-coder for RTL and testbench generation
+Agentic RTL Coder — AI-powered Verilog RTL generation pipeline.
 
-Produces a complete artifact folder `rtl_pipeline_work/` next to this script:
- - design.v
- - testbench.v
- - tb.vcd
- - sim.out
- - rtl_gen_raw.txt
- - enhanced_prompt.txt
- - lint.log
- - simulation.log
- - design_info.json
- - README.md
- - test_vectors.txt (best-effort extraction)
+Uses local Ollama models to:
+  1. Enhance a hardware design specification
+  2. Generate synthesisable Verilog RTL
+  3. Lint the RTL with Verilator (self-correcting feedback loop)
+  4. Generate a matching testbench
+  5. Simulate with Icarus Verilog (self-correcting feedback loop)
+
+Artifacts are written to ``rtl_pipeline_work/`` next to this script.
 """
+
+from __future__ import annotations
 
 import argparse
 import json
-import os
+import logging
 import re
 import shutil
 import subprocess
 import sys
-import time
-from datetime import datetime
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-# -------------------------
-# Configuration / Defaults
-# -------------------------
-LLAMA_PROMPT_MODEL = "llama3.1:latest"
-DEEPSEEK_MODEL = "deepseek-coder-v2:latest"
+# ---------------------------------------------------------------------------
+# Logger
+# ---------------------------------------------------------------------------
+log = logging.getLogger("agentic_rtl_coder")
+
+# ---------------------------------------------------------------------------
+# Defaults (overridable via CLI)
+# ---------------------------------------------------------------------------
+DEFAULT_PROMPT_MODEL = "llama3.1:latest"
+DEFAULT_RTL_MODEL = "deepseek-coder-v2:latest"
 WORKDIR_NAME = "rtl_pipeline_work"
 MAX_RETRIES_DEFAULT = 25
+OLLAMA_TIMEOUT_DEFAULT = 600  # seconds
+
 VERILATOR_CMD = "verilator"
 IVERILOG_CMD = "iverilog"
 VVP_CMD = "vvp"
 
-# -------------------------
-# Utility helpers
-# -------------------------
-class DesignState(dict):
-    def __getattr__(self, k):
-        try:
-            return self[k]
-        except KeyError:
-            raise AttributeError(k)
-    def __setattr__(self, k, v):
-        self[k] = v
 
-def bail(msg: str, rc: int = 1):
-    print(msg, file=sys.stderr)
+# ---------------------------------------------------------------------------
+# Pipeline state
+# ---------------------------------------------------------------------------
+@dataclass
+class DesignState:
+    """Tracks all mutable state throughout the RTL generation pipeline."""
+
+    user_prompt: str
+    work_dir: str
+    work_dir_path: Path
+    run_started: str
+
+    # Models (configurable per run)
+    prompt_model: str = DEFAULT_PROMPT_MODEL
+    rtl_model: str = DEFAULT_RTL_MODEL
+    ollama_timeout: int = OLLAMA_TIMEOUT_DEFAULT
+
+    # Pipeline outputs
+    enhanced_prompt: str = ""
+    prompt_raw: Optional[dict] = None
+    rtl_file: Optional[str] = None
+    tb_file: Optional[str] = None
+    last_rtl_text: str = ""
+    last_tb_text: str = ""
+
+    # Lint / simulation results
+    lint_passed: bool = False
+    lint_log: str = ""
+    simulation_passed: bool = False
+    simulation_log: str = ""
+
+    # Retry counters
+    rtl_retries: int = 0
+    tb_retries: int = 0
+
+    # Audit trail
+    llm_calls: list = field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# Utility helpers
+# ---------------------------------------------------------------------------
+def bail(msg: str, rc: int = 1) -> None:
+    """Log a critical error and exit the process."""
+    log.critical(msg)
     sys.exit(rc)
 
+
 def check_tool(name: str) -> bool:
+    """Return ``True`` if *name* is found on ``PATH``."""
     return shutil.which(name) is not None
 
-def require_tool(name: str):
-    if not check_tool(name):
-        bail(f"❌ Required tool '{name}' not found. Please install it and ensure it is in PATH.")
 
-def run_proc(cmd, cwd=None, input_text: Optional[str]=None, timeout: Optional[int]=None):
-    """Run subprocess and return dict with returncode/stdout/stderr."""
+def require_tools(*names: str) -> None:
+    """Exit with a clear message if any required CLI tools are missing."""
+    missing = [n for n in names if not check_tool(n)]
+    if missing:
+        bail(
+            "❌ Required tool(s) not found in PATH: "
+            + ", ".join(missing)
+            + "\n   Please install them and ensure they are on PATH.",
+            rc=2,
+        )
+
+
+def run_proc(
+    cmd: list[str],
+    cwd: Optional[str] = None,
+    input_text: Optional[str] = None,
+    timeout: Optional[int] = None,
+) -> dict:
+    """Run a subprocess and return a dict with ``rc``, ``stdout``, ``stderr``."""
     try:
-        r = subprocess.run(cmd, cwd=cwd, input=input_text, capture_output=True, text=True, timeout=timeout)
+        r = subprocess.run(
+            cmd,
+            cwd=cwd,
+            input=input_text,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
         return {"rc": r.returncode, "stdout": r.stdout or "", "stderr": r.stderr or ""}
-    except FileNotFoundError as e:
-        return {"rc": None, "stdout": "", "stderr": str(e)}
-    except subprocess.TimeoutExpired as e:
-        return {"rc": -1, "stdout": e.stdout or "", "stderr": "TimeoutExpired"}
+    except FileNotFoundError as exc:
+        return {"rc": None, "stdout": "", "stderr": str(exc)}
+    except subprocess.TimeoutExpired:
+        return {"rc": -1, "stdout": "", "stderr": "TimeoutExpired"}
 
-def call_ollama(model: str, prompt: str) -> dict:
+
+def call_ollama(
+    model: str,
+    prompt: str,
+    timeout: int = OLLAMA_TIMEOUT_DEFAULT,
+) -> dict:
     """
-    Call local Ollama model: `ollama run <model>` with prompt on stdin.
-    Returns dict {"rc", "stdout", "stderr"}.
+    Call a local Ollama model via ``ollama run <model>`` with *prompt* on stdin.
+
+    Returns a dict with ``rc``, ``stdout``, ``stderr``.
     """
-    if shutil.which("ollama") is None:
+    if not check_tool("ollama"):
         bail("❌ Ollama CLI not found. Install Ollama and ensure `ollama` is in PATH.")
     cmd = ["ollama", "run", model]
-    return run_proc(cmd, input_text=prompt)
+    log.debug("Calling Ollama model %s (timeout=%ds)", model, timeout)
+    return run_proc(cmd, input_text=prompt, timeout=timeout)
+
 
 def extract_code_block(text: str, lang_hint: Optional[str] = None) -> str:
-    """Extract fenced code block or return from first 'module' occurrence."""
+    """
+    Extract the first fenced code block from *text*.
+
+    Falls back to returning everything from the first ``module`` keyword onwards,
+    or the entire text if nothing else matches.
+    """
     if not text:
         return ""
-    # First try triple-backtick fences
-    fence_re = re.compile(r"```(?:\s*" + (lang_hint or r"[^\n`]*") + r")?\s*(.*?)```", re.S | re.I)
-    m = fence_re.search(text)
+    # Try triple-backtick fences — with an explicit language hint first,
+    # then fall back to any fenced block.
+    if lang_hint:
+        fence_re = re.compile(
+            r"```\s*" + lang_hint + r"\s*\n(.*?)```", re.S | re.I
+        )
+        m = fence_re.search(text)
+        if m:
+            return m.group(1).strip()
+    # Generic fence: ``` optionally followed by a language tag on the same line
+    generic_re = re.compile(r"```[^\n]*\n(.*?)```", re.S)
+    m = generic_re.search(text)
     if m:
         return m.group(1).strip()
-    # Otherwise, find first line that starts with 'module' (common in Verilog)
+    # Fall back to first line starting with 'module'
     lines = text.splitlines()
     for i, line in enumerate(lines):
         if line.strip().startswith("module"):
             return "\n".join(lines[i:]).strip()
-    # fallback: return entire text
+    # Last resort: return everything
     return text.strip()
+
 
 def sanitize_backtick_includes(verilog_text: str) -> str:
     """
-    Fix common issues like `include being turned into include by LLMs,
-    or missing backticks. We try to ensure `include has the backtick.
+    Fix common LLM mistakes with Verilog ```include`` directives.
+
+    LLMs frequently emit ``include`` without the backtick, or escape it as
+    ``\\`include``.  This function normalises both cases.
     """
-    # replace " include" with " `include" when pattern looks like it should be a Verilog directive
-    # careful: don't double-insert
-    corrected = re.sub(r'(?m)^(?P<ws>\s*)(?:include)\s+["<]', r'\g<ws>`include "', verilog_text)
-    # Fix cases where LLM emitted ' `include' incorrectly escaped
+    corrected = re.sub(
+        r'(?m)^(?P<ws>\s*)(?:include)\s+["<]',
+        r'\g<ws>`include "',
+        verilog_text,
+    )
     corrected = corrected.replace("\\`include", "`include")
     return corrected
 
-def write_text_file(path: Path, content: str):
+
+def write_text_file(path: Path, content: str) -> None:
+    """Write *content* to *path*, creating parent directories if needed."""
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content if content is not None else "", encoding="utf-8")
 
-# -------------------------
+
+# ---------------------------------------------------------------------------
 # Pipeline stages
-# -------------------------
+# ---------------------------------------------------------------------------
 def prompt_enhancer(state: DesignState) -> DesignState:
-    print("\n[Prompt Enhancer] Using", LLAMA_PROMPT_MODEL)
-    prompt = f"Enhance this hardware design specification for RTL generation:\n\n{state['user_prompt']}\n\nProvide a concise implementable spec."
-    res = call_ollama(LLAMA_PROMPT_MODEL, prompt)
-    state["prompt_raw"] = res
-    enhanced = (res["stdout"] or "").strip()
-    state["enhanced_prompt"] = enhanced
+    """Use a language model to expand and clarify the user's design spec."""
+    log.info("[Prompt Enhancer] Using %s", state.prompt_model)
+    prompt = (
+        "Enhance this hardware design specification for RTL generation:\n\n"
+        f"{state.user_prompt}\n\n"
+        "Provide a concise, implementable spec."
+    )
+    res = call_ollama(state.prompt_model, prompt, timeout=state.ollama_timeout)
+    state.prompt_raw = res
+    state.enhanced_prompt = (res["stdout"] or "").strip()
     return state
 
-def rtl_generator(state: DesignState, lint_feedback: Optional[str] = None) -> DesignState:
-    print("\n[RTL Generator] Using", DEEPSEEK_MODEL)
-    prompt = f"Generate synthesizable Verilog RTL for the following specification:\n\n{state['enhanced_prompt']}\n\nRequirements: synthesizable, use non-blocking assignments in sequential blocks where appropriate, avoid compiler-specific directives, produce a single module."
+
+def rtl_generator(
+    state: DesignState,
+    lint_feedback: Optional[str] = None,
+) -> DesignState:
+    """Generate synthesisable Verilog from the enhanced spec."""
+    log.info("[RTL Generator] Using %s", state.rtl_model)
+    prompt = (
+        "Generate synthesizable Verilog RTL for the following specification:\n\n"
+        f"{state.enhanced_prompt}\n\n"
+        "Requirements: synthesizable, use non-blocking assignments in sequential "
+        "blocks where appropriate, avoid compiler-specific directives, produce a "
+        "single module."
+    )
     if lint_feedback:
-        prompt += f"\n\nThe previously generated RTL failed lint with these errors:\n{lint_feedback}\nPlease fix the RTL to address these errors and produce clean Verilog."
-    res = call_ollama(DEEPSEEK_MODEL, prompt)
-    state.setdefault("llm_calls", []).append({"stage": "rtl_generator", "raw": res})
+        prompt += (
+            "\n\nThe previously generated RTL failed lint with these errors:\n"
+            f"{lint_feedback}\n"
+            "Please fix the RTL to address these errors and produce clean Verilog."
+        )
+
+    res = call_ollama(state.rtl_model, prompt, timeout=state.ollama_timeout)
+    state.llm_calls.append({"stage": "rtl_generator", "raw": res})
     raw_out = res["stdout"] or ""
-    # Save raw LLM output
-    write_text_file(state["work_dir_path"] / "rtl_gen_raw.txt", raw_out)
-    # Attempt to extract verilog code
+
+    # Persist raw LLM output for auditing
+    write_text_file(state.work_dir_path / "rtl_gen_raw.txt", raw_out)
+
+    # Extract and sanitise Verilog
     verilog = extract_code_block(raw_out, lang_hint="verilog")
     verilog = sanitize_backtick_includes(verilog)
-    # As a last-ditch, ensure there's a module keyword; if not, wrap with module skeleton
+
+    # Last-ditch fallback: ensure there is a module keyword
     if "module" not in verilog:
-        verilog = f"// Fallback generated module\nmodule auto_gen_dummy();\nendmodule\n\n/* Original LLM output\n{raw_out}\n*/"
-    # Write to design.v
-    write_text_file(state["work_dir_path"] / "design.v", verilog)
-    state["rtl_file"] = str(state["work_dir_path"] / "design.v")
-    state["last_rtl_text"] = verilog
+        verilog = (
+            "// Fallback generated module\n"
+            "module auto_gen_dummy();\nendmodule\n\n"
+            f"/* Original LLM output\n{raw_out}\n*/"
+        )
+
+    write_text_file(state.work_dir_path / "design.v", verilog)
+    state.rtl_file = str(state.work_dir_path / "design.v")
+    state.last_rtl_text = verilog
     return state
+
 
 def run_lint(state: DesignState) -> DesignState:
-    print("\n[Lint Agent] Running Verilator...")
-    rtl_path = state.get("rtl_file")
+    """Lint the generated RTL with Verilator ``--lint-only``."""
+    log.info("[Lint] Running Verilator lint-only …")
+    rtl_path = state.rtl_file
     if not rtl_path or not Path(rtl_path).exists():
-        state["lint_passed"] = False
-        state["lint_log"] = "No RTL file"
-        write_text_file(state["work_dir_path"] / "lint.log", state["lint_log"])
+        state.lint_passed = False
+        state.lint_log = "No RTL file found."
+        write_text_file(state.work_dir_path / "lint.log", state.lint_log)
         return state
-    # run verilator --lint-only
+
     cmd = [VERILATOR_CMD, "--lint-only", rtl_path]
     res = run_proc(cmd)
+
     lint_out = ""
-    lint_out += "STDOUT:\n" + res["stdout"] + "\n" if res["stdout"] else ""
-    lint_out += "STDERR:\n" + res["stderr"] + "\n" if res["stderr"] else ""
-    write_text_file(state["work_dir_path"] / "lint.log", lint_out)
-    state["lint_log"] = lint_out
-    state["lint_passed"] = (res["rc"] == 0)
-    if state["lint_passed"]:
-        print("[Lint] ✅ Passed")
+    if res["stdout"]:
+        lint_out += "STDOUT:\n" + res["stdout"] + "\n"
+    if res["stderr"]:
+        lint_out += "STDERR:\n" + res["stderr"] + "\n"
+
+    write_text_file(state.work_dir_path / "lint.log", lint_out)
+    state.lint_log = lint_out
+    state.lint_passed = res["rc"] == 0
+
+    if state.lint_passed:
+        log.info("[Lint] ✅ Passed")
     else:
-        print("[Lint] ❌ Failed (see lint.log)")
+        log.warning("[Lint] ❌ Failed (see lint.log)")
     return state
 
-def testbench_generator(state: DesignState, sim_feedback: Optional[str] = None) -> DesignState:
-    print("\n[Testbench Generator] Using", DEEPSEEK_MODEL)
-    # Provide the cleaned RTL to the model so it can craft a matching testbench
-    rtl_text = Path(state["rtl_file"]).read_text(encoding="utf-8") if state.get("rtl_file") else ""
+
+def testbench_generator(
+    state: DesignState,
+    sim_feedback: Optional[str] = None,
+) -> DesignState:
+    """Generate a Verilog testbench that exercises the design module."""
+    log.info("[Testbench Generator] Using %s", state.rtl_model)
+    rtl_text = ""
+    if state.rtl_file and Path(state.rtl_file).exists():
+        rtl_text = Path(state.rtl_file).read_text(encoding="utf-8")
+
     prompt = (
-        f"Write a Verilog testbench for the following RTL module.\n"
-        f"Include $dumpfile/$dumpvars to produce tb.vcd, run a reasonable number of cycles, "
-        f"and do basic checks (no Xs). Provide only the testbench code block.\n\nRTL:\n{rtl_text}"
+        "Write a Verilog testbench for the following RTL module.\n"
+        "Include $dumpfile/$dumpvars to produce tb.vcd, run a reasonable "
+        "number of cycles, and do basic checks (no Xs). "
+        "Provide only the testbench code block.\n\n"
+        f"RTL:\n{rtl_text}"
     )
     if sim_feedback:
-        prompt += f"\n\nThe previous testbench/simulation failed with these errors:\n{sim_feedback}\nPlease fix the testbench accordingly."
-    res = call_ollama(DEEPSEEK_MODEL, prompt)
-    state.setdefault("llm_calls", []).append({"stage": "testbench_generator", "raw": res})
+        prompt += (
+            "\n\nThe previous testbench/simulation failed with these errors:\n"
+            f"{sim_feedback}\n"
+            "Please fix the testbench accordingly."
+        )
+
+    res = call_ollama(state.rtl_model, prompt, timeout=state.ollama_timeout)
+    state.llm_calls.append({"stage": "testbench_generator", "raw": res})
     raw_tb = res["stdout"] or ""
-    write_text_file(state["work_dir_path"] / "tb_raw.txt", raw_tb)
+    write_text_file(state.work_dir_path / "tb_raw.txt", raw_tb)
+
     tb_code = extract_code_block(raw_tb, lang_hint="verilog")
-    # Ensure $dumpfile/$dumpvars exist so VCD is produced
+
+    # Ensure VCD dumping — wrapped in a proper initial block
     if "$dumpfile" not in tb_code:
-        tb_code = "$dumpfile(\"tb.vcd\");\n$dumpvars(0,tb);\n" + tb_code
-    write_text_file(state["work_dir_path"] / "testbench.v", tb_code)
-    state["tb_file"] = str(state["work_dir_path"] / "testbench.v")
-    state["last_tb_text"] = tb_code
+        tb_code = (
+            'initial begin\n'
+            '  $dumpfile("tb.vcd");\n'
+            '  $dumpvars(0, tb);\n'
+            'end\n\n'
+            + tb_code
+        )
+
+    write_text_file(state.work_dir_path / "testbench.v", tb_code)
+    state.tb_file = str(state.work_dir_path / "testbench.v")
+    state.last_tb_text = tb_code
     return state
+
 
 def simulate(state: DesignState) -> DesignState:
-    print("\n[Simulator] Compiling with Icarus (iverilog)...")
-    rtl = state.get("rtl_file")
-    tb = state.get("tb_file")
+    """Compile and run the design + testbench with Icarus Verilog."""
+    log.info("[Simulator] Compiling with Icarus Verilog …")
+    rtl = state.rtl_file
+    tb = state.tb_file
     if not (rtl and tb):
-        state["simulation_passed"] = False
-        state["simulation_log"] = "Missing RTL or testbench"
-        write_text_file(state["work_dir_path"] / "simulation.log", state["simulation_log"])
+        state.simulation_passed = False
+        state.simulation_log = "Missing RTL or testbench file."
+        write_text_file(state.work_dir_path / "simulation.log", state.simulation_log)
         return state
-    # compile to sim.out inside workdir
-    out_exec = str(state["work_dir_path"] / "sim.out")
+
+    out_exec = str(state.work_dir_path / "sim.out")
     cmd_compile = [IVERILOG_CMD, "-o", out_exec, rtl, tb]
-    comp_res = run_proc(cmd_compile, cwd=state["work_dir"])
+    comp_res = run_proc(cmd_compile, cwd=state.work_dir)
     compile_log = (comp_res["stdout"] or "") + (comp_res["stderr"] or "")
-    write_text_file(state["work_dir_path"] / "compile.log", compile_log)
+    write_text_file(state.work_dir_path / "compile.log", compile_log)
+
     if comp_res["rc"] != 0:
-        state["simulation_passed"] = False
-        state["simulation_log"] = "Compile failed:\n" + compile_log
-        write_text_file(state["work_dir_path"] / "simulation.log", state["simulation_log"])
-        print("[Simulator] ❌ Compile Error (see compile.log)")
+        state.simulation_passed = False
+        state.simulation_log = "Compile failed:\n" + compile_log
+        write_text_file(state.work_dir_path / "simulation.log", state.simulation_log)
+        log.warning("[Simulator] ❌ Compile error (see compile.log)")
         return state
-    # run vvp from workdir so tb.vcd is created there
-    print("[Simulator] Running sim.out with vvp (will create tb.vcd if testbench dumps it)...")
-    run_res = run_proc([VVP_CMD, out_exec], cwd=state["work_dir"])
+
+    log.info("[Simulator] Running vvp …")
+    run_res = run_proc([VVP_CMD, out_exec], cwd=state.work_dir)
     sim_log = (run_res["stdout"] or "") + (run_res["stderr"] or "")
-    write_text_file(state["work_dir_path"] / "simulation.log", sim_log)
-    state["simulation_log"] = sim_log
-    state["simulation_passed"] = (run_res["rc"] == 0)
-    if state["simulation_passed"]:
-        print("[Simulator] ✅ Passed")
+    write_text_file(state.work_dir_path / "simulation.log", sim_log)
+    state.simulation_log = sim_log
+    state.simulation_passed = run_res["rc"] == 0
+
+    if state.simulation_passed:
+        log.info("[Simulator] ✅ Passed")
     else:
-        print("[Simulator] ❌ Runtime Error (see simulation.log)")
+        log.warning("[Simulator] ❌ Runtime error (see simulation.log)")
     return state
 
-# -------------------------
-# Helpers for artifacts
-# -------------------------
-def make_readme(workdir_path: Path, state: DesignState):
+
+# ---------------------------------------------------------------------------
+# Artifact helpers
+# ---------------------------------------------------------------------------
+def make_readme(workdir_path: Path, state: DesignState) -> None:
+    """Write a ``README.md`` inside the work directory describing the artifacts."""
     readme_lines = [
         "# RTL Pipeline Workdir",
         "",
-        f"Generated at: {datetime.utcnow().isoformat()} UTC",
+        f"Generated at: {datetime.now(timezone.utc).isoformat()} UTC",
         "",
         "## Files",
         "",
-        "- `design.v` - generated Verilog RTL (cleaned)",
-        "- `testbench.v` - generated testbench",
-        "- `tb.vcd` - waveform (if testbench writes it)",
-        "- `sim.out` - compiled simulation binary",
-        "- `rtl_gen_raw.txt` - raw LLM output for RTL",
-        "- `tb_raw.txt` - raw LLM output for testbench",
-        "- `enhanced_prompt.txt` - the enhanced spec from llama3.1",
-        "- `lint.log` - verilator lint output",
-        "- `compile.log` - iverilog compile output",
-        "- `simulation.log` - vvp runtime output",
-        "- `design_info.json` - metadata about this run",
+        "| File | Description |",
+        "|---|---|",
+        "| `design.v` | Generated Verilog RTL (cleaned) |",
+        "| `testbench.v` | Generated testbench |",
+        "| `tb.vcd` | Waveform dump (if testbench writes it) |",
+        "| `sim.out` | Compiled simulation binary |",
+        "| `rtl_gen_raw.txt` | Raw LLM output for RTL |",
+        "| `tb_raw.txt` | Raw LLM output for testbench |",
+        "| `enhanced_prompt.txt` | Enhanced spec from prompt model |",
+        "| `lint.log` | Verilator lint output |",
+        "| `compile.log` | Icarus Verilog compile output |",
+        "| `simulation.log` | vvp runtime output |",
+        "| `design_info.json` | Metadata about this run |",
         "",
         "## How to re-run locally",
+        "",
         "```bash",
-        f"iverilog -o sim.out design.v testbench.v",
+        "iverilog -o sim.out design.v testbench.v",
         "vvp sim.out",
-        "gtkwave tb.vcd   # to view waveforms (if tb.vcd exists)",
+        "gtkwave tb.vcd   # view waveforms",
         "```",
         "",
         "## Notes",
-        "- The LLM raw outputs are preserved for auditing in `rtl_gen_raw.txt` and `tb_raw.txt`.",
+        "",
+        "- Raw LLM outputs are preserved for auditing in `rtl_gen_raw.txt` and `tb_raw.txt`.",
+        f"- Prompt model: `{state.prompt_model}`",
+        f"- RTL model: `{state.rtl_model}`",
     ]
     write_text_file(workdir_path / "README.md", "\n".join(readme_lines))
 
-def save_design_info(workdir_path: Path, state: DesignState):
+
+def save_design_info(workdir_path: Path, state: DesignState) -> None:
+    """Write a JSON metadata file summarising the pipeline run."""
     info = {
-        "user_prompt": state.get("user_prompt"),
-        "enhanced_prompt_present": bool(state.get("enhanced_prompt")),
-        "rtl_file": state.get("rtl_file"),
-        "tb_file": state.get("tb_file"),
-        "lint_passed": bool(state.get("lint_passed")),
-        "simulation_passed": bool(state.get("simulation_passed")),
+        "user_prompt": state.user_prompt,
+        "enhanced_prompt_present": bool(state.enhanced_prompt),
+        "models": {
+            "prompt": state.prompt_model,
+            "rtl": state.rtl_model,
+        },
+        "rtl_file": state.rtl_file,
+        "tb_file": state.tb_file,
+        "lint_passed": state.lint_passed,
+        "simulation_passed": state.simulation_passed,
         "timestamps": {
-            "run_started": state.get("run_started"),
-            "run_finished": datetime.utcnow().isoformat()
+            "run_started": state.run_started,
+            "run_finished": datetime.now(timezone.utc).isoformat(),
         },
         "retries": {
-            "rtl_retries": state.get("rtl_retries", 0),
-            "tb_retries": state.get("tb_retries", 0)
+            "rtl_retries": state.rtl_retries,
+            "tb_retries": state.tb_retries,
         },
-        "notes": "Generated by rtl_pipeline_full.py"
+        "notes": "Generated by agentic_rtl_coder.py",
     }
     write_text_file(workdir_path / "design_info.json", json.dumps(info, indent=2))
 
-def extract_test_vectors(workdir_path: Path, state: DesignState):
+
+def extract_test_vectors(workdir_path: Path, state: DesignState) -> None:
     """
-    Try to extract simple test vectors from the testbench: clock/reset/enable sequences.
-    This is best-effort: we look for obvious numeric constants or $urandom_range seeds.
+    Best-effort extraction of test-vector metadata from the testbench.
+
+    This is intentionally simple — it scrapes ``$urandom_range`` parameters and
+    ``for``-loop bounds.  A more sophisticated version could parse full
+    stimulus/response tables.
     """
-    tb_text = Path(state["tb_file"]).read_text(encoding="utf-8") if state.get("tb_file") else ""
-    vectors = []
-    # find urandom_range usage and cycles loop values
-    urandom_matches = re.findall(r"\$urandom_range\(([^)]*)\)", tb_text)
-    for m in urandom_matches:
+    if not state.tb_file or not Path(state.tb_file).exists():
+        return
+    tb_text = Path(state.tb_file).read_text(encoding="utf-8")
+    vectors: list[str] = []
+
+    for m in re.findall(r"\$urandom_range\(([^)]*)\)", tb_text):
         vectors.append(f"urandom_range: {m.strip()}")
-    cycles_match = re.search(r"for\s*\(\s*.*?;\s*.*?<\s*(\d+)\s*;\s*.*?\)", tb_text)
+
+    cycles_match = re.search(
+        r"for\s*\(\s*.*?;\s*.*?<\s*(\d+)\s*;\s*.*?\)", tb_text
+    )
     if cycles_match:
         vectors.append(f"cycles: {cycles_match.group(1)}")
+
     if vectors:
         write_text_file(workdir_path / "test_vectors.txt", "\n".join(vectors))
 
-# -------------------------
+
+# ---------------------------------------------------------------------------
 # Main orchestration
-# -------------------------
-def main(argv=None):
-    p = argparse.ArgumentParser(prog="rtl_pipeline_full", description="RTL pipeline (Ollama + Verilator + Icarus).")
-    p.add_argument("--spec", "-s", type=str, help="Design specification (text).")
-    p.add_argument("--max-retries", "-r", type=int, default=MAX_RETRIES_DEFAULT, help="Max retries for RTL and TB.")
-    p.add_argument("--keep-workdir", action="store_true", help="Do not recreate the workdir; keep existing (appends).")
+# ---------------------------------------------------------------------------
+def _setup_logging(verbose: bool = False) -> None:
+    """Configure structured logging for the pipeline."""
+    level = logging.DEBUG if verbose else logging.INFO
+    fmt = "%(asctime)s  %(levelname)-8s  %(message)s"
+    logging.basicConfig(level=level, format=fmt, datefmt="%H:%M:%S")
+
+
+def main(argv: Optional[list[str]] = None) -> None:
+    """Entry-point for the Agentic RTL Coder pipeline."""
+    p = argparse.ArgumentParser(
+        prog="agentic_rtl_coder",
+        description=(
+            "Agentic RTL Coder — AI-powered Verilog generation pipeline "
+            "(Ollama + Verilator + Icarus Verilog)."
+        ),
+    )
+    p.add_argument(
+        "--spec", "-s",
+        type=str,
+        help="Design specification (text). If omitted you will be prompted interactively.",
+    )
+    p.add_argument(
+        "--prompt-model",
+        type=str,
+        default=DEFAULT_PROMPT_MODEL,
+        help=f"Ollama model for prompt enhancement (default: {DEFAULT_PROMPT_MODEL}).",
+    )
+    p.add_argument(
+        "--rtl-model",
+        type=str,
+        default=DEFAULT_RTL_MODEL,
+        help=f"Ollama model for RTL & testbench generation (default: {DEFAULT_RTL_MODEL}).",
+    )
+    p.add_argument(
+        "--max-retries", "-r",
+        type=int,
+        default=MAX_RETRIES_DEFAULT,
+        help=f"Max retry attempts for RTL and testbench (default: {MAX_RETRIES_DEFAULT}).",
+    )
+    p.add_argument(
+        "--timeout", "-t",
+        type=int,
+        default=OLLAMA_TIMEOUT_DEFAULT,
+        help=f"Timeout in seconds for each Ollama call (default: {OLLAMA_TIMEOUT_DEFAULT}).",
+    )
+    p.add_argument(
+        "--keep-workdir",
+        action="store_true",
+        help="Preserve existing workdir instead of recreating it.",
+    )
+    p.add_argument(
+        "--verbose", "-v",
+        action="store_true",
+        help="Enable debug-level logging.",
+    )
     args = p.parse_args(argv)
 
-    # ensure required tools exist
-    for t in (VERILATOR_CMD, IVERILOG_CMD, VVP_CMD, "ollama"):
-        if not check_tool(t):
-            bail(f"❌ Required tool not found in PATH: {t}\nPlease install or add to PATH.", rc=2)
+    _setup_logging(verbose=args.verbose)
 
-    # compute workdir next to this script
+    # Pre-flight: ensure required CLI tools are available
+    require_tools(VERILATOR_CMD, IVERILOG_CMD, VVP_CMD, "ollama")
+
+    # Resolve workdir next to this script
     script_dir = Path(__file__).parent.resolve()
     workdir_path = script_dir / WORKDIR_NAME
 
-    # recreate workdir unless user asked to keep it (for fresh run)
     if workdir_path.exists() and not args.keep_workdir:
+        log.info("Removing previous workdir: %s", workdir_path)
         shutil.rmtree(workdir_path)
     workdir_path.mkdir(parents=True, exist_ok=True)
 
-    # initial state
-    state = DesignState()
-    state["user_prompt"] = args.spec or input("Enter RTL design spec: ").strip()
-    state["work_dir"] = str(workdir_path)
-    state["work_dir_path"] = workdir_path
-    state["run_started"] = datetime.utcnow().isoformat()
-    state["rtl_retries"] = 0
-    state["tb_retries"] = 0
+    # Initialise pipeline state
+    state = DesignState(
+        user_prompt=args.spec or input("Enter RTL design spec: ").strip(),
+        work_dir=str(workdir_path),
+        work_dir_path=workdir_path,
+        run_started=datetime.now(timezone.utc).isoformat(),
+        prompt_model=args.prompt_model,
+        rtl_model=args.rtl_model,
+        ollama_timeout=args.timeout,
+    )
 
-    # Save enhanced prompt raw and LLM outputs to files in workdir as we go
-    # Start the pipeline
     max_retries = args.max_retries
-    rtl_retry_count = 0
-    tb_retry_count = 0
 
-    # Save enhanced prompt file helper
-    def save_enhanced_prompt_file():
-        ep = state.get("enhanced_prompt", "")
-        write_text_file(workdir_path / "enhanced_prompt.txt", ep)
+    def save_enhanced_prompt_file() -> None:
+        write_text_file(workdir_path / "enhanced_prompt.txt", state.enhanced_prompt)
 
     try:
-        # Step 1: enhance prompt
+        # ── Step 1: Enhance the user's spec ───────────────────────────
         state = prompt_enhancer(state)
         save_enhanced_prompt_file()
 
+        # ── Steps 2–3: RTL generation ↔ Verilator lint feedback loop ─
         while True:
-            # Step 2: generate RTL (with optional lint feedback)
-            lint_feedback = state.get("lint_log") if rtl_retry_count > 0 else None
+            lint_feedback = state.lint_log if state.rtl_retries > 0 else None
             state = rtl_generator(state, lint_feedback=lint_feedback)
-
-            # save enhanced prompt (again) and raw rtl output already saved inside rtl_generator
             save_enhanced_prompt_file()
 
-            # Step 3: lint
             state = run_lint(state)
-            # If lint failed, retry with feedback
-            if not state.get("lint_passed", False):
-                rtl_retry_count += 1
-                state["rtl_retries"] = rtl_retry_count
-                if rtl_retry_count > max_retries:
-                    print("❌ RTL generation retry limit reached. Aborting.")
+            if state.lint_passed:
+                break
+
+            state.rtl_retries += 1
+            if state.rtl_retries > max_retries:
+                log.error(
+                    "❌ RTL lint retry limit (%d) reached. Aborting.",
+                    max_retries,
+                )
+                break
+            log.info(
+                "🔁 Lint failed — regenerating RTL (attempt %d/%d)",
+                state.rtl_retries,
+                max_retries,
+            )
+
+        # ── Steps 4–5: Testbench generation ↔ simulation loop ────────
+        #    (only runs if lint passed)
+        if state.lint_passed:
+            while True:
+                sim_feedback = (
+                    state.simulation_log if state.tb_retries > 0 else None
+                )
+                state = testbench_generator(state, sim_feedback=sim_feedback)
+                state = simulate(state)
+
+                if state.simulation_passed:
+                    log.info("✅ Design, linting, and simulation all passed!")
                     break
-                print("[Trackback] 🔁 Lint failed – regenerating RTL with lint feedback.")
-                continue  # loop back to rtl_generator with lint feedback
 
-            # Step 4: generate testbench (with possible sim feedback)
-            sim_feedback = state.get("simulation_log") if tb_retry_count > 0 else None
-            state = testbench_generator(state, sim_feedback=sim_feedback)
-
-            # Step 5: simulate (compile + run)
-            state = simulate(state)
-
-            if not state.get("simulation_passed", False):
-                tb_retry_count += 1
-                state["tb_retries"] = tb_retry_count
-                if tb_retry_count > max_retries:
-                    print("❌ Testbench retry limit reached. Aborting.")
+                state.tb_retries += 1
+                if state.tb_retries > max_retries:
+                    log.error(
+                        "❌ Testbench retry limit (%d) reached. Aborting.",
+                        max_retries,
+                    )
                     break
-                print("[Trackback] 🔁 Simulation failed – regenerating testbench with simulation feedback.")
-                continue  # regenerate testbench
-            # success
-            print("\n✅ Design, linting, and simulation succeeded!")
-            break
+                log.info(
+                    "🔁 Simulation failed — regenerating testbench (attempt %d/%d)",
+                    state.tb_retries,
+                    max_retries,
+                )
 
     finally:
-        # Always write artifacts and metadata
-        # Ensure enhanced prompt stored
+        # Always persist artifacts and metadata, regardless of outcome
         save_enhanced_prompt_file()
-        # Save simulation/lint logs already done inside functions
-        # If tb.vcd exists, move/rename accordingly (it should be in workdir already)
-        # Save README and design_info.json
         make_readme(workdir_path, state)
         save_design_info(workdir_path, state)
-        # Extract simple test vectors if possible
+
         try:
             extract_test_vectors(workdir_path, state)
         except Exception:
-            pass
+            log.debug("Test-vector extraction failed (non-critical).", exc_info=True)
 
-        # Final summary to user
-        print("\nArtifacts written to:", workdir_path)
-        print("Important files:")
-        for f in [
+        # Final summary
+        log.info("Artifacts written to: %s", workdir_path)
+        expected_files = [
             "design.v", "testbench.v", "tb.vcd", "sim.out",
             "rtl_gen_raw.txt", "tb_raw.txt", "enhanced_prompt.txt",
-            "lint.log", "compile.log", "simulation.log", "design_info.json", "README.md"
-        ]:
-            p = workdir_path / f
-            print(f" - {f} {'(exists)' if p.exists() else '(missing)'}")
+            "lint.log", "compile.log", "simulation.log",
+            "design_info.json", "README.md",
+        ]
+        for f in expected_files:
+            exists = (workdir_path / f).exists()
+            log.info("  %s %s", "✔" if exists else "✘", f)
 
-# Entry point
+
 if __name__ == "__main__":
     main()
