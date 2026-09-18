@@ -26,7 +26,6 @@ import sys
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
 
 # ---------------------------------------------------------------------------
 # Logger
@@ -66,9 +65,9 @@ class DesignState:
 
     # Pipeline outputs
     enhanced_prompt: str = ""
-    prompt_raw: Optional[dict] = None
-    rtl_file: Optional[str] = None
-    tb_file: Optional[str] = None
+    prompt_raw: dict | None = None
+    rtl_file: str | None = None
+    tb_file: str | None = None
     last_rtl_text: str = ""
     last_tb_text: str = ""
 
@@ -114,9 +113,9 @@ def require_tools(*names: str) -> None:
 
 def run_proc(
     cmd: list[str],
-    cwd: Optional[str] = None,
-    input_text: Optional[str] = None,
-    timeout: Optional[int] = None,
+    cwd: str | None = None,
+    input_text: str | None = None,
+    timeout: int | None = None,
 ) -> dict:
     """Run a subprocess and return a dict with ``rc``, ``stdout``, ``stderr``."""
     try:
@@ -152,7 +151,7 @@ def call_ollama(
     return run_proc(cmd, input_text=prompt, timeout=timeout)
 
 
-def extract_code_block(text: str, lang_hint: Optional[str] = None) -> str:
+def extract_code_block(text: str, lang_hint: str | None = None) -> str:
     """
     Extract the first fenced code block from *text*.
 
@@ -225,7 +224,7 @@ def prompt_enhancer(state: DesignState) -> DesignState:
 
 def rtl_generator(
     state: DesignState,
-    lint_feedback: Optional[str] = None,
+    lint_feedback: str | None = None,
 ) -> DesignState:
     """Generate synthesisable Verilog from the enhanced spec."""
     log.info("[RTL Generator] Using %s", state.rtl_model)
@@ -300,7 +299,7 @@ def run_lint(state: DesignState) -> DesignState:
 
 def testbench_generator(
     state: DesignState,
-    sim_feedback: Optional[str] = None,
+    sim_feedback: str | None = None,
 ) -> DesignState:
     """Generate a Verilog testbench that exercises the design module."""
     log.info("[Testbench Generator] Using %s", state.rtl_model)
@@ -488,7 +487,7 @@ def _setup_logging(verbose: bool = False) -> None:
     logging.basicConfig(level=level, format=fmt, datefmt="%H:%M:%S")
 
 
-def main(argv: Optional[list[str]] = None) -> None:
+def main(argv: list[str] | None = None) -> None:
     """Entry-point for the Agentic RTL Coder pipeline."""
     p = argparse.ArgumentParser(
         prog="agentic_rtl_coder",

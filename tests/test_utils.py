@@ -3,14 +3,14 @@
 from __future__ import annotations
 
 import json
-import textwrap
-from pathlib import Path
-from unittest.mock import patch
-
-import pytest
+import os
 
 # Import the module under test
-import sys, os
+import sys
+import textwrap
+from pathlib import Path
+
+import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import agentic_rtl_coder as arc
